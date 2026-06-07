@@ -19,6 +19,92 @@ import threading
 from crawler_engine import AutoCrawler, check_playwright_available
 
 
+class PaginationDialog(tk.Toplevel):
+    """翻页选择对话框 — 必须从主线程创建"""
+
+    def __init__(self, parent, pagination_info):
+        super().__init__(parent)
+        self.result = 'current'
+        self.page_start = 1
+        self.page_end = 1
+        page_count = len(pagination_info['pages'])
+        page_type = pagination_info['type']
+
+        self.title("翻页检测")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Info label
+        ttk.Label(self, text=f"检测到翻页机制 ({page_type}, {page_count} 个链接)，是否同时爬取其他页面？",
+                  wraplength=350).pack(pady=(12, 5))
+
+        # Radio buttons
+        self.choice = tk.StringVar(value='current')
+        ttk.Radiobutton(self, text="仅当前页", variable=self.choice,
+                        value='current').pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(self, text="全部页面", variable=self.choice,
+                        value='all').pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(self, text="自定义页码范围", variable=self.choice,
+                        value='range').pack(anchor=tk.W, padx=20)
+
+        # Range input
+        range_frame = ttk.Frame(self)
+        range_frame.pack(pady=5)
+        ttk.Label(range_frame, text="从").pack(side=tk.LEFT, padx=2)
+        self.start_entry = ttk.Entry(range_frame, width=6, justify=tk.CENTER)
+        self.start_entry.pack(side=tk.LEFT, padx=2)
+        self.start_entry.insert(0, '1')
+        ttk.Label(range_frame, text="到").pack(side=tk.LEFT, padx=2)
+        self.end_entry = ttk.Entry(range_frame, width=6, justify=tk.CENTER)
+        self.end_entry.pack(side=tk.LEFT, padx=2)
+        self.end_entry.insert(0, str(page_count))
+
+        # Buttons
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=(5, 12))
+        ttk.Button(btn_frame, text="确定", command=self._confirm).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self._cancel).pack(side=tk.LEFT, padx=5)
+
+        # Validation: only enable range entry when 'range' is selected
+        def toggle_range(*_):
+            state = 'normal' if self.choice.get() == 'range' else 'disabled'
+            self.start_entry.configure(state=state)
+            self.end_entry.configure(state=state)
+        self.choice.trace_add('write', toggle_range)
+        toggle_range()
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_window()
+
+    def _confirm(self):
+        choice = self.choice.get()
+        if choice == 'range':
+            s = self.start_entry.get().strip()
+            e = self.end_entry.get().strip()
+            if not s.isdigit() or not e.isdigit():
+                messagebox.showerror("输入错误", "页码请输入数字", parent=self)
+                return
+            self.page_start = int(s)
+            self.page_end = int(e)
+            if self.page_start < 1 or self.page_end < 1:
+                messagebox.showerror("输入错误", "页码必须≥1", parent=self)
+                return
+            if self.page_start > self.page_end:
+                messagebox.showerror("输入错误", "起始页码不能大于结束页码", parent=self)
+                return
+        self.result = choice
+        self.destroy()
+
+    def _cancel(self):
+        self.result = 'current'
+        self.destroy()
+
+
 class ImageCrawlerGUI:
     def __init__(self, root):
         self.root = root
@@ -238,38 +324,100 @@ class ImageCrawlerGUI:
         ).start()
 
     def crawl_thread(self, url, save_path):
-        """爬取线程函数"""
+        """爬取线程函数 — 支持翻页检测和多页爬取"""
         try:
-            # 使用AutoCrawler提取图片（自动判断是否需要JS渲染）
             crawler = AutoCrawler(
                 log_callback=self.log_message,
                 force_js=self.use_js_var.get()
             )
-            image_urls = crawler.extract_images(url)
 
-            if not image_urls:
+            # Step 1: Detect pagination on the first page
+            self.log_message("正在检测翻页机制...")
+            pagination = crawler.detect_pagination(url)
+
+            # Step 2: Determine which pages to crawl
+            page_urls = [url]  # always include the current page
+            if pagination['pages']:
+                event = threading.Event()
+                result = {}
+
+                def show_dialog():
+                    dlg = PaginationDialog(self.root, pagination)
+                    result['choice'] = dlg.result
+                    result['start'] = dlg.page_start
+                    result['end'] = dlg.page_end
+                    event.set()
+
+                self.root.after(0, show_dialog)
+                event.wait()
+
+                choice = result.get('choice', 'current')
+                if choice == 'all':
+                    extras = [p['url'] for p in pagination['pages'] if p['url'] != url]
+                    page_urls = [url] + extras
+                    self.log_message(f"将爬取全部 {len(page_urls)} 页")
+                elif choice == 'range':
+                    s = result.get('start', 1)
+                    e = result.get('end', 1)
+                    selected = [p['url'] for idx, p in enumerate(pagination['pages'])
+                                if s - 1 <= idx <= e - 1 and p['url'] != url]
+                    page_urls = [url] + selected
+                    self.log_message(f"将爬取 {len(page_urls)} 页 (范围 {s}-{e})")
+                else:
+                    self.log_message("仅爬取当前页")
+            else:
+                self.log_message("未检测到翻页机制")
+
+            # Step 3: Crawl all pages
+            all_image_urls = []
+            total_pages = len(page_urls)
+
+            for i, page_url in enumerate(page_urls):
+                if total_pages > 1:
+                    self.update_status(f"正在爬取第 {i + 1}/{total_pages} 页...")
+                    self.log_message(f"正在爬取第 {i + 1}/{total_pages} 页: {page_url}")
+                else:
+                    self.update_status("正在提取图片...")
+
+                page_images = crawler.extract_images(page_url)
+                all_image_urls.extend(page_images)
+
+            # Step 4: Deduplicate across pages
+            seen = set()
+            unique = []
+            for img in all_image_urls:
+                if img not in seen:
+                    seen.add(img)
+                    unique.append(img)
+
+            dedup_count = len(all_image_urls) - len(unique)
+            if dedup_count > 0:
+                self.log_message(f"跨页去重移除 {dedup_count} 个重复图片")
+            self.log_message(f"共提取到 {len(unique)} 张图片 ({total_pages} 页汇总)")
+
+            if not unique:
                 self.root.after(0, lambda: messagebox.showinfo("提示", "未找到图片"))
                 return
 
-            # 下载图片（使用独立session）
+            # Step 5: Download images
             session = requests.Session()
-            downloaded, failed = self.download_images(image_urls, base_url=url, session=session)
+            downloaded, failed = self.download_images(unique, base_url=url, session=session)
 
             if not downloaded:
                 self.root.after(0, lambda: messagebox.showwarning("警告", "没有图片被下载"))
                 return
 
-            # 显示图片预览
+            # Step 6: Display images
             self.root.after(0, lambda: self.display_images(downloaded, failed, save_path))
 
-            # 统计信息
-            self.root.after(0, lambda: messagebox.showinfo(
-                "完成",
+            stats = (
                 f"爬取完成!\n\n"
                 f"成功: {len(downloaded)} 张\n"
-                f"失败: {len(failed)} 张\n\n"
+                f"失败: {len(failed)} 张\n"
+                f"总页数: {total_pages}\n\n"
                 f"请勾选需要保存的图片并点击「保存选中图片」按钮"
-            ))
+            )
+            self.root.after(0, lambda: messagebox.showinfo("完成", stats))
 
         except Exception as e:
             self.log_message(f"爬取过程出错: {str(e)}")

@@ -24,6 +24,77 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
+# ============ 翻页检测 & 常量 ============
+
+MAX_IMAGES = 100
+
+_PAGINATION_CSS_CLASSES = (
+    'pagination', 'page-nav', 'pages', 'pager',
+    'page-navigation', 'nav-links', 'page-numbers',
+)
+_PAGINATION_NEXT = frozenset({'下一页', '下一頁', 'next', '›', '»', '>'})
+_PAGINATION_PREV = frozenset({'上一页', '上一頁', 'prev', '‹', '«', '<'})
+_PAGINATION_ALL_NAV = _PAGINATION_NEXT | _PAGINATION_PREV
+
+
+def detect_pagination_from_html(html_text, base_url):
+    """从HTML文本中检测翻页链接。
+
+    返回:
+        {'type': 'page_list'|'next_prev'|None, 'pages': [{'label': str, 'url': str}, ...]}
+    """
+    soup = BeautifulSoup(html_text, 'html.parser')
+    pages = []
+    seen = set()
+
+    def try_add(label, url):
+        if not url or not url.startswith(('http://', 'https://')):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        pages.append({'label': label.strip() or '', 'url': url})
+
+    # 1. <link rel="next"> / <link rel="prev">
+    for rel in ('next', 'prev'):
+        for link in soup.find_all('link', attrs={'rel': rel}):
+            try_add(rel, urljoin(base_url, link.get('href') or ''))
+
+    # 2. CSS-based pagination containers
+    containers = []
+    for cls in _PAGINATION_CSS_CLASSES:
+        containers.extend(soup.find_all(class_=re.compile(re.escape(cls), re.I)))
+
+    for container in containers:
+        for a in container.find_all('a', href=True):
+            try_add(a.get_text(strip=True), urljoin(base_url, a.get('href', '')))
+
+    # 3. Fallback: scan all <a> tags for nav keywords or numeric page numbers
+    if not containers:
+        for a in soup.find_all('a', href=True):
+            text = a.get_text(strip=True)
+            url = urljoin(base_url, a.get('href', ''))
+            if not url.startswith(('http://', 'https://')):
+                continue
+            lowered = text.lower()
+            if any(w in lowered for w in _PAGINATION_ALL_NAV):
+                try_add(text, url)
+            elif text.isdigit() and 1 <= int(text) <= 9999:
+                try_add(text, url)
+
+    if not pages:
+        return {'type': None, 'pages': []}
+
+    has_nums = any(p['label'].isdigit() for p in pages)
+    has_nav = any(
+        any(w in p['label'].lower() for w in _PAGINATION_ALL_NAV)
+        for p in pages
+    )
+    return {
+        'type': 'page_list' if has_nums else ('next_prev' if has_nav else 'page_list'),
+        'pages': pages,
+    }
+
 
 def _ensure_playwright_browsers_path():
     """确保PLAYWRIGHT_BROWSERS_PATH已设置，默认指向D:\\Apps"""
@@ -448,17 +519,20 @@ class JSCrawler:
     """JS动态渲染页面图片提取器（基于 Playwright）"""
 
     def __init__(self, log_callback=None, headless=True, scroll_delay=0.8,
-                 max_scrolls=10, timeout=30000):
+                 max_scrolls=10, timeout=30000, max_images=MAX_IMAGES):
         self.log = log_callback or (lambda msg: None)
         self.headless = headless
         self.scroll_delay = scroll_delay
         self.max_scrolls = max_scrolls
         self.timeout = timeout
+        self.max_images = max_images
         self._playwright = None
         self._browser = None
 
-    def extract_images(self, url):
+    def extract_images(self, url, max_images=None):
         """使用浏览器渲染页面并提取图片URL"""
+        if max_images is None:
+            max_images = self.max_images
         try:
             _ensure_playwright_browsers_path()
             from playwright.sync_api import sync_playwright
@@ -479,16 +553,17 @@ class JSCrawler:
             page.set_default_timeout(self.timeout)
 
             self.log(f"浏览器正在加载: {url}")
-            page.goto(url, wait_until='networkidle', timeout=self.timeout)
-            # 等待 Vue/Vuetify 等 SPA 框架完成初始渲染
+            page.goto(url, wait_until='domcontentloaded', timeout=self.timeout)
             try:
                 page.wait_for_function('() => document.readyState === "complete"', timeout=10000)
             except Exception:
                 pass
-            time.sleep(1.5)
+            time.sleep(2.0)
             self.log(f"页面加载完成，标题: {page.title()}")
 
-            images = self._scroll_and_collect(page)
+            images = self._scroll_and_collect(page, max_images)
+            if images and len(images) < max_images:
+                images = self._auto_click_load_more(page, images, max_images)
             self.log(f"JS渲染提取到 {len(images)} 个图片")
 
             page.close()
@@ -541,15 +616,18 @@ class JSCrawler:
 
         return context
 
-    def _scroll_and_collect(self, page):
-        """滚动页面并收集所有图片URL"""
+    def _scroll_and_collect(self, page, max_images=MAX_IMAGES):
+        """滚动页面并收集所有图片URL，达到max_images时提前终止"""
         all_urls = set()
 
-        # 初始提取（scroll=0，不滚动直接提取当前可见区域的图片）
         initial_urls = page.evaluate(EXTRACTION_SCRIPT)
         for u in initial_urls:
             if u and not u.startswith('data:'):
                 all_urls.add(u)
+
+        if len(all_urls) >= max_images:
+            self.log(f"已达到{max_images}张图片上限")
+            return list(all_urls)
 
         total_height = page.evaluate('document.body.scrollHeight')
         viewport_height = page.evaluate('window.innerHeight')
@@ -558,19 +636,21 @@ class JSCrawler:
         for scroll_num in range(self.max_scrolls):
             scroll_to = (scroll_num + 1) * scroll_step
             page.evaluate(f'window.scrollTo(0, {scroll_to})')
-
             time.sleep(self.scroll_delay)
-
             try:
-                page.wait_for_load_state('networkidle', timeout=5000)
+                page.wait_for_load_state('domcontentloaded', timeout=5000)
             except Exception:
                 pass
+            time.sleep(1.0)
 
             urls = page.evaluate(EXTRACTION_SCRIPT)
-
             for u in urls:
                 if u and not u.startswith('data:'):
                     all_urls.add(u)
+
+            if len(all_urls) >= max_images:
+                self.log(f"已达到{max_images}张图片上限，停止滚动")
+                break
 
             new_height = page.evaluate('document.body.scrollHeight')
             current_scroll = page.evaluate('window.scrollY + window.innerHeight')
@@ -578,11 +658,10 @@ class JSCrawler:
                 self.log(f"已到达页面底部，提前结束 (第 {scroll_num + 1} 次)")
                 break
 
-        # 最终兜底：额外等待后再次提取（捕获异步懒加载的图片）
         self.log("等待异步图片加载完成...")
         time.sleep(2.0)
         try:
-            page.wait_for_load_state('networkidle', timeout=8000)
+            page.wait_for_load_state('domcontentloaded', timeout=8000)
         except Exception:
             pass
         final_urls = page.evaluate(EXTRACTION_SCRIPT)
@@ -607,6 +686,86 @@ class JSCrawler:
         self._browser = None
         self._playwright = None
 
+    def _auto_click_load_more(self, page, current_images, max_images):
+        """自动点击"显示更多/加载更多"按钮以展开全部图片"""
+        all_urls = set(current_images)
+        click_strategies = [
+            # Text-based: buttons/links containing these strings
+            lambda: page.locator('button:has-text("显示更多"):visible').first,
+            lambda: page.locator('button:has-text("加载更多"):visible').first,
+            lambda: page.locator('button:has-text("查看更多"):visible').first,
+            lambda: page.locator('button:has-text("Show more"):visible').first,
+            lambda: page.locator('button:has-text("Load more"):visible').first,
+            lambda: page.locator('button:has-text("View more"):visible').first,
+            lambda: page.locator('a:has-text("显示更多"):visible').first,
+            lambda: page.locator('a:has-text("加载更多"):visible').first,
+            lambda: page.locator('a:has-text("查看更多"):visible').first,
+            lambda: page.locator('a:has-text("Show more"):visible').first,
+            lambda: page.locator('a:has-text("Load more"):visible').first,
+            # CSS class based
+            lambda: page.locator('.load-more:visible').first,
+            lambda: page.locator('.show-more:visible').first,
+            lambda: page.locator('.btn-more:visible').first,
+            lambda: page.locator('.load_more:visible').first,
+            # aria-label
+            lambda: page.locator('[aria-label*="load more" i]:visible').first,
+            lambda: page.locator('[aria-label*="show more" i]:visible').first,
+            # data-action
+            lambda: page.locator('[data-action*="load-more"]:visible').first,
+            lambda: page.locator('[data-action*="show-more"]:visible').first,
+        ]
+
+        for click_num in range(20):
+            if len(all_urls) >= max_images:
+                self.log(f"已达到{max_images}张图片上限，停止加载")
+                break
+
+            button = None
+            for strategy in click_strategies:
+                try:
+                    candidate = strategy()
+                    if candidate.count() > 0 and candidate.is_visible():
+                        button = candidate
+                        break
+                except Exception:
+                    continue
+
+            if not button:
+                if click_num == 0:
+                    self.log("未找到加载更多按钮")
+                else:
+                    self.log("加载更多按钮已消失，停止")
+                break
+
+            try:
+                before_count = len(all_urls)
+                button.click()
+                time.sleep(1.5)
+                try:
+                    page.wait_for_load_state('domcontentloaded', timeout=5000)
+                except Exception:
+                    pass
+                time.sleep(1.0)
+
+                urls = page.evaluate(EXTRACTION_SCRIPT)
+                for u in urls:
+                    if u and not u.startswith('data:'):
+                        all_urls.add(u)
+
+                self.log(f"已点击加载更多 (第{click_num + 1}次)，当前共 {len(all_urls)} 张图片")
+
+                if len(all_urls) >= max_images:
+                    self.log(f"已达到{max_images}张图片上限，停止加载")
+                    break
+                if len(all_urls) <= before_count:
+                    self.log("图片数未增加，停止自动加载")
+                    break
+            except Exception as e:
+                self.log(f"点击加载更多时出错: {str(e)}")
+                break
+
+        return list(all_urls)
+
 
 # ====================================================================
 
@@ -614,9 +773,10 @@ class JSCrawler:
 class AutoCrawler:
     """智能图片提取器 — 自动判断是否需要JS渲染"""
 
-    def __init__(self, log_callback=None, force_js=False):
+    def __init__(self, log_callback=None, force_js=False, max_images=MAX_IMAGES):
         self.log = log_callback or (lambda msg: None)
         self.force_js = force_js
+        self.max_images = max_images
 
     def extract_images(self, url):
         """提取图片URL，自动选择提取方式"""
@@ -658,6 +818,42 @@ class AutoCrawler:
             self.log("页面不依赖JS渲染，但未找到图片")
             return []
 
+    def detect_pagination(self, url):
+        """检测页面翻页机制。返回翻页信息dict。"""
+        try:
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            })
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            result = detect_pagination_from_html(resp.text, url)
+            if result['pages']:
+                self.log(f"检测到翻页: {result['type']}, {len(result['pages'])} 个链接")
+                for p in result['pages']:
+                    self.log(f"  - {p['label']}: {p['url']}")
+                return result
+        except Exception as e:
+            self.log(f"翻页检测失败: {str(e)}")
+        return {'type': None, 'pages': []}
+
+    def crawl_pages(self, page_urls):
+        """多页爬取生成器，yield (page_index, page_url, image_urls)。
+        自动跳过重复URL，汇总后需自行去重。
+        """
+        seen_urls = set()
+        for idx, page_url in enumerate(page_urls):
+            if page_url in seen_urls:
+                continue
+            seen_urls.add(page_url)
+            try:
+                images = self.extract_images(page_url)
+                yield idx, page_url, images
+            except Exception as e:
+                self.log(f"第 {idx + 1} 页加载失败: {str(e)}")
+                yield idx, page_url, []
+
     def _js_extract(self, url):
-        js_crawler = JSCrawler(log_callback=self.log)
+        js_crawler = JSCrawler(log_callback=self.log, max_images=self.max_images)
         return js_crawler.extract_images(url)
