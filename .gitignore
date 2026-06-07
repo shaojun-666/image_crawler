@@ -1,0 +1,35 @@
+# 临时目录
+temp_crawl/
+dist/temp_crawl/
+
+# 测试下载的图片
+pic/
+
+# 构建产物
+build/
+*.spec
+
+# PyInstaller 输出
+dist/*.exe
+
+# 日志文件
+*.log
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境
+.env
+.venv
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
