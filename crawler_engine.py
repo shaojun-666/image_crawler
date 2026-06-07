@@ -380,7 +380,18 @@ EXTRACTION_SCRIPT = r"""
 
     /* 2. CSS background-image (inline styles) */
     document.querySelectorAll('[style*="background"]').forEach(el => {
-        extractBg(el.style.backgroundImage);
+        const bgValue = el.style.backgroundImage;
+        if (bgValue && bgValue !== 'none') {
+            extractBg(bgValue);
+        } else {
+            /* 回退：当 el.style.backgroundImage 为空时，直接从 style 属性原文中提取 */
+            const rawStyle = el.getAttribute('style') || '';
+            const m = rawStyle.match(/background-image\s*:\s*url\(["']?([^"')]+)["']?\)/i);
+            if (m) {
+                const r = resolve(m[1].trim());
+                if (r) urls.add(r);
+            }
+        }
     });
 
     /* 3. CSS background-image (computed styles on image-related class names) */
@@ -469,6 +480,12 @@ class JSCrawler:
 
             self.log(f"浏览器正在加载: {url}")
             page.goto(url, wait_until='networkidle', timeout=self.timeout)
+            # 等待 Vue/Vuetify 等 SPA 框架完成初始渲染
+            try:
+                page.wait_for_function('() => document.readyState === "complete"', timeout=10000)
+            except Exception:
+                pass
+            time.sleep(1.5)
             self.log(f"页面加载完成，标题: {page.title()}")
 
             images = self._scroll_and_collect(page)
@@ -528,6 +545,12 @@ class JSCrawler:
         """滚动页面并收集所有图片URL"""
         all_urls = set()
 
+        # 初始提取（scroll=0，不滚动直接提取当前可见区域的图片）
+        initial_urls = page.evaluate(EXTRACTION_SCRIPT)
+        for u in initial_urls:
+            if u and not u.startswith('data:'):
+                all_urls.add(u)
+
         total_height = page.evaluate('document.body.scrollHeight')
         viewport_height = page.evaluate('window.innerHeight')
         scroll_step = max(1, total_height // self.max_scrolls)
@@ -554,6 +577,18 @@ class JSCrawler:
             if current_scroll >= new_height:
                 self.log(f"已到达页面底部，提前结束 (第 {scroll_num + 1} 次)")
                 break
+
+        # 最终兜底：额外等待后再次提取（捕获异步懒加载的图片）
+        self.log("等待异步图片加载完成...")
+        time.sleep(2.0)
+        try:
+            page.wait_for_load_state('networkidle', timeout=8000)
+        except Exception:
+            pass
+        final_urls = page.evaluate(EXTRACTION_SCRIPT)
+        for u in final_urls:
+            if u and not u.startswith('data:'):
+                all_urls.add(u)
 
         return list(all_urls)
 
@@ -594,9 +629,11 @@ class AutoCrawler:
         images, html = static_crawler.extract_images(url)
 
         if images:
-            # 如果静态模式找到的图片很少（<5张），怀疑可能是图标/logo而非内容图片，
-            # 尝试JS渲染模式作为补充
-            if len(images) < 5:
+            # 检测页面是否使用 SPA 框架（Vue/Vuetify/React等）
+            # 这类页面中的图片通常由 JS 动态渲染，静态爬虫无法提取
+            has_spa_mark = any(indicator in html for indicator in
+                ['id="app"', 'id="__nuxt"', 'id="__next"', 'v-image', 'v-app', 'vuetify'])
+            if len(images) < 5 or has_spa_mark:
                 self.log(f"静态提取仅找到 {len(images)} 张，尝试JS渲染模式补充...")
                 static_only = len(images)
                 js_images = self._js_extract(url)
