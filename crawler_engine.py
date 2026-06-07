@@ -166,14 +166,13 @@ class StaticCrawler:
         """<img> 标签：src / data-src / srcset 等"""
         images = []
         for img in soup.find_all('img'):
-            # 懒加载属性
+            # 懒加载属性：收集所有合法URL，不提前break
             for attr in _IMG_LAZY_ATTRS:
                 val = img.get(attr)
                 if val:
                     full_url = urljoin(base_url, val)
                     if full_url and _has_image_ext(full_url):
                         images.append(full_url)
-                        break
             # srcset / data-srcset
             for sattr in ('srcset', 'data-srcset'):
                 val = img.get(sattr)
@@ -211,7 +210,6 @@ class StaticCrawler:
                         full_url = urljoin(base_url, val)
                         if full_url and _has_image_ext(full_url):
                             images.append(full_url)
-                            break
         return images
 
     def _extract_video_posters(self, soup, base_url):
@@ -268,7 +266,8 @@ class StaticCrawler:
             href = link.get('href')
             if href:
                 full_url = urljoin(base_url, href)
-                if full_url and _has_image_ext(full_url):
+                # as="image" already asserts this is an image, no need to check extension
+                if full_url and not full_url.startswith('data:'):
                     images.append(full_url)
         for link in soup.find_all('link', attrs={'rel': re.compile(r'icon|apple-touch-icon', re.I)}):
             href = link.get('href')
@@ -294,7 +293,6 @@ class StaticCrawler:
                             full_url = urljoin(base_url, val)
                             if full_url and _has_image_ext(full_url):
                                 images.append(full_url)
-                                break
             except Exception:
                 pass
         return images
@@ -369,12 +367,12 @@ EXTRACTION_SCRIPT = r"""
         }
     };
 
-    /* 1. <img> tags */
+    /* 1. <img> tags — collect ALL image URLs, don't break on first match */
     const imgAttrs = ['src','data-src','data-lazy-src','data-original','data-lazy','data-echo','data-url'];
     document.querySelectorAll('img').forEach(img => {
         for (const attr of imgAttrs) {
             const val = img.getAttribute(attr);
-            if (val) { const r = resolve(val); if (r) { urls.add(r); break; } }
+            if (val) { const r = resolve(val); if (r) urls.add(r); }
         }
         extractSrcset(img.getAttribute('srcset'));
         extractSrcset(img.getAttribute('data-srcset'));
@@ -404,9 +402,9 @@ EXTRACTION_SCRIPT = r"""
         if (r) urls.add(r);
     });
 
-    /* 6. svg image */
-    document.querySelectorAll('image[href],image[xlink\:href]').forEach(svgImg => {
-        const href = svgImg.getAttribute('href') || svgImg.getAttribute('xlink:href');
+    /* 6. svg image (avoid xlink: href CSS selector which is invalid) */
+    document.querySelectorAll('image').forEach(svgImg => {
+        const href = svgImg.getAttribute('href') || svgImg.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || svgImg.getAttribute('xlink:href');
         if (href) { const r = resolve(href); if (r) urls.add(r); }
     });
 
@@ -596,7 +594,21 @@ class AutoCrawler:
         images, html = static_crawler.extract_images(url)
 
         if images:
-            self.log(f"静态提取成功，找到 {len(images)} 张图片")
+            # 如果静态模式找到的图片很少（<5张），怀疑可能是图标/logo而非内容图片，
+            # 尝试JS渲染模式作为补充
+            if len(images) < 5:
+                self.log(f"静态提取仅找到 {len(images)} 张，尝试JS渲染模式补充...")
+                static_only = len(images)
+                js_images = self._js_extract(url)
+                # 合并去重
+                seen = set(images)
+                for img in js_images:
+                    if img not in seen:
+                        seen.add(img)
+                        images.append(img)
+                self.log(f"综合提取到 {len(images)} 张图片（静态{static_only}+JS新增{len(images)-static_only}）")
+            else:
+                self.log(f"静态提取成功，找到 {len(images)} 张图片")
             return images
 
         self.log("静态提取未找到图片，检测页面是否依赖JS渲染...")
